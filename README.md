@@ -614,9 +614,9 @@ This project is available under the **MIT License**. See individual module licen
 **Repository**: AIS-trajectory_forecasting  
 
 **Special Thanks to:**
-- CEE (Connecticut Environmental Engineering) team
+- Crimson Energy Experts-team
 - Original TrAISformer authors
-- Danish Maritime Authority for data access
+  United States Coastal - NOAA for Data Accessibility.
 
 ---
 
@@ -632,4 +632,4 @@ For questions, issues, or collaboration opportunities:
 
 **Last Updated**: March 2026  
 **Status**: Production Ready  
-**Version**: 1.0.0
+**Version**: 1.0.1
