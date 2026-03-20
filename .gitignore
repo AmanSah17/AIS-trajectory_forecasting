@@ -1,0 +1,192 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Python executable
+python.exe
+Scripts/python.exe
+Scripts/pythonw.exe
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.dbf
+*.mdb
+*.accdb
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Large data files
+Data/
+*.parquet
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.tar.gz
+*.zip
+*.7z
+*.rar
+
+# MLflow artifacts (large training logs)
+CEE-Transformer_architecture_driven_trajectory_forecasting/CEE-Replication/mlruns/
+CEE-Transformer_architecture_driven_trajectory_forecasting/CEE-Replication/Geohashed_traisformer/mlruns/
+
+# Processed data (large)
+CEE-Transformer_architecture_driven_trajectory_forecasting/CEE-Replication/traisformer_data/
+CEE-Transformer_architecture_driven_trajectory_forecasting/CEE-Replication/Geohashed_traisformer/processed/
+CEE-Transformer_architecture_driven_trajectory_forecasting/CEE-Replication/Geohashed_traisformer/pkl/
+CEE-Transformer_architecture_driven_trajectory_forecasting/CEE-Replication/Geohashed_traisformer/embeddings/
+
+# Model checkpoints (store only in results/latest if needed)
+*.pt
+*.pth
+*.ckpt
+models/*
+!models/.gitkeep
+
+# Results that are too large
+CEE-Transformer_architecture_driven_trajectory_forecasting/CEE-Replication/results/*/
+CEE-Transformer_architecture_driven_trajectory_forecasting/CEE-Replication/Geohashed_traisformer/results/*/
+CEE-Transformer_architecture_driven_trajectory_forecasting/CEE-Replication/Geohashed_traisformer/logs/
+
+# OS files
+Thumbs.db
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# Editor backups
+.#*
+
+# OS-specific
+*.sublime-project
+*.sublime-workspace

@@ -1,0 +1,1348 @@
+
+
+=== Cell 0 [markdown] ===
+# 05- Model Hyperparameter tuning -  TrAISformer MLOps Replication (Region 1)
+
+This notebook provides:
+- Class-wise modular AIS preprocessing (paper-style filters)
+- TrAISformer dataset export (`*.pkl`) compatible with `CEE_TrAISformer`
+- MLflow tracking (loss, accuracy, params, artifacts, logs)
+- Crash-safe resume (`last_checkpoint.pt`) and best model save
+- Early stopping with max 50 epochs
+
+Environment note:
+Run from your target env before opening Jupyter:
+`source ~/Desktop/Deepdarshk/code_source/env.bin/activate`
+
+=== Cell 1 [markdown] ===
+This copy has been modified to operate on the **quarter‑1 merged parquet** (January+February+March) produced by the Geohashed pipeline.  All downstream preprocessing, export and training stages remain the same, but the dataset origin is now a single file rather than separate monthly files.
+
+=== Cell 2 [code] ===
+from pathlib import Path
+import os, sys, json, pickle
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+from torch.utils.data import DataLoader
+import pandas as pd
+
+# root of overall project (global path used for imports and data)
+ROOT = Path('/home/crimsondeepdarshak/Desktop/Deep_Darshak/References/TRAIS_former_paper_Work_')
+
+# geohashed paper directory and notebook directory
+GEODIR = ROOT / 'CEE-Replication' / 'Geohashed_traisformer'
+NOTEBOOK_DIR = GEODIR / 'Notebooks'
+
+# make sure the typical nested structure exists for outputs, pickles, embeddings, etc
+for sub in ['processed', 'pkl', 'embeddings', 'results', 'logs']:
+    (GEODIR / sub).mkdir(parents=True, exist_ok=True)
+
+# paths to external code and data directories (global scope)
+TRAISFORMER_DIR = ROOT / 'CEE_TrAISformer'
+MAIN_NOTEBOOK_DIR = ROOT / 'CEE-Replication' / 'Notebook'
+REGION_DATA_DIR = ROOT / 'CEE-Replication' / 'traisformer_data' / 'region_1'
+RUN_DIR = ROOT / 'CEE-Replication' / 'results' / 'region_1_trAISformer_mlops'
+
+# add paths to sys.path for imports
+assert TRAISFORMER_DIR.exists(), TRAISFORMER_DIR
+sys.path.insert(0, str(TRAISFORMER_DIR))
+sys.path.insert(0, str(MAIN_NOTEBOOK_DIR))  # for traisformer_mlops
+sys.path.insert(0, str(NOTEBOOK_DIR))
+
+print('Using root:', ROOT)
+print('Using src:', TRAISFORMER_DIR)
+print('Using notebook:', NOTEBOOK_DIR)
+print('Run dir:', RUN_DIR)
+
+=== Cell 3 [markdown] ===
+### Path setup & directory structure
+
+The notebook uses **global project paths** (rooted at `ROOT`) for all imports and data artifacts.  We also create a nested folder layout inside the `Geohashed_traisformer` sub‑directory so that pickles, embeddings, processed parquet files, results and logs live in predictable locations.
+
+All source code for the TrAISformer project is pulled in by adding `TRAISFORMER_DIR` to `sys.path`.  Whenever data files (parquet, `.pkl`, `.npy` embeddings, etc.) are produced later they should be written to one of the subfolders under `GEODIR` (e.g. `pkl/`, `embeddings/`).
+
+This keeps the notebook self‑contained while still leveraging the shared code at the global level.
+
+=== Cell 4 [code] ===
+import datasets, models, trainers
+from traisformer_mlops import (
+    AISPreprocessor,
+    PreprocessingConfig,
+    ExportConfig,
+    TrAISformerDataExporter,
+    EarlyStoppingConfig,
+    TrAISformerMLflowTrainer,
+)
+
+try:
+    import mlflow
+    print('mlflow version:', mlflow.__version__)
+except Exception as e:
+    print('mlflow not available. Install with: pip install mlflow')
+    raise
+
+=== Cell 5 [markdown] ===
+## 1) Preprocessing + Export (paper criteria)
+
+Implemented filters:
+- remove near coastline (`<1 nm`) if coastline polygons + shapely available
+- split non-contiguous voyages (`max gap = 2h`)
+- remove short voyages (`<20 msgs` or duration `<4h`)
+- remove abnormal empirical speed (`>40 knots`)
+- remove unrealistic SOG (`>=30 knots`) and moored/anchor-like rows
+- downsample to 10 minutes
+- split long voyages to max 20 hours
+
+=== Cell 6 [code] ===
+import pandas as pd
+
+# For the first quarter we already produced a unified parquet
+input_path = "/home/crimsondeepdarshak/Desktop/Deep_Darshak/References/TRAIS_former_paper_Work_/CEE-Replication/Geohashed_traisformer/processed/clean_interpolated/region_1_first_three_2025.parquet"
+print("reading existing Q1 merged file:", input_path)
+df = pd.read_parquet(input_path)
+print("rows loaded", len(df))
+
+# copy a local working version into the Notebook folder so downstream cells work
+output_file = NOTEBOOK_DIR / 'region_1_q1_merged.parquet'
+df.to_parquet(output_file, index=False)
+print("Copied merged Q1 parquet to", output_file)
+
+=== Cell 7 [code] ===
+# Rename columns to match the expected preprocessing schema
+# The Geohashed pipeline output has different column names than the standard AIS format
+
+print("Original columns:", list(df.columns))
+print("Shape:", df.shape)
+
+column_mapping = {
+    'BASEDATETIME': 'Time',
+    'LON': 'Longitude',
+    'LAT': 'Latitude',
+}
+
+df_renamed = df.rename(columns=column_mapping)
+
+# Verify the rename
+print("\nRenamed columns:", list(df_renamed.columns))
+print("Expected columns: ['Time', 'MMSI', 'Latitude', 'Longitude', 'SOG', 'COG', 'NAVSTATUS', 'VESSEL_TYPE', 'final_voyage_id', 'is_interpolated']")
+
+# Save the renamed version 
+output_file_renamed = NOTEBOOK_DIR / 'region_1_q1_merged_renamed.parquet'
+df_renamed.to_parquet(output_file_renamed, index=False)
+print(f"\nSaved renamed parquet to: {output_file_renamed}")
+
+# Use the renamed dataframe going forward
+df = df_renamed
+
+=== Cell 8 [markdown] ===
+### How pickles are created from the clean Parquet
+
+The exporter (`TrAISformerDataExporter`) takes the cleaned DataFrame from the preprocessing step and:
+1. Normalizes lat/lon/sog/cog according to metadata.
+2. Slides a fixed window across each voyage sequence, producing overlapping trajectories.
+3. Converts each window into a dictionary with keys `traj`, `mask`, `time`, `mmsi`, etc.
+4. Splits into train/valid/test according to the ratios passed in `ExportConfig`.
+5. Serializes the resulting lists to disk as three `.pkl` files (`*_train.pkl`, `*_valid.pkl`, `*_test.pkl`).
+
+The cell following this description loads those files so you can inspect their structure.
+
+=== Cell 9 [code] ===
+RUN_PREPROCESS = True  # set True for full preprocessing from parquet; set False to use existing pickles
+# Use the renamed parquet file (with standard column names) that was created in the previous cell
+parquet_path = NOTEBOOK_DIR / 'region_1_q1_merged_renamed.parquet'
+coastline_pickle = TRAISFORMER_DIR / 'data' / 'ct_dma' / 'merged_dma_coastline_polygons.pkl'
+
+# Ensure the parquet file exists before preprocessing
+if not parquet_path.exists():
+    print(f"Error: Parquet file not found at {parquet_path}")
+    print("Please run the parquet loading and renaming cells first.")
+else:
+    if RUN_PREPROCESS:
+        print("Starting preprocessing and export...")
+        pre_cfg = PreprocessingConfig(
+            max_gap_hours=2.0,
+            min_voyage_messages=20,
+            min_voyage_hours=4.0,
+            max_empirical_speed_knots=40.0,
+            max_sog_knots=30.0,
+            downsample_minutes=10,
+            max_seq_hours=20.0,
+            keep_only_underway=True,
+            coastline_min_nm=1.0,
+        )
+        pre = AISPreprocessor(pre_cfg)
+        df_clean = pre.run(parquet_path=parquet_path, coastline_pickle=coastline_pickle)
+        print(f"Cleaned dataframe: {len(df_clean)} rows")
+
+        exporter = TrAISformerDataExporter(ExportConfig(max_sog=30.0, train_ratio=0.8, valid_ratio=0.1, seed=42))
+        meta = exporter.export(df_clean, REGION_DATA_DIR)
+        print('Exported metadata:', json.dumps(meta, indent=2))
+    else:
+        print('Skipping preprocessing. Using existing exported pickles.')
+        if (REGION_DATA_DIR / 'metadata.json').exists():
+            meta = json.loads((REGION_DATA_DIR / 'metadata.json').read_text())
+            print(json.dumps(meta, indent=2))
+        else:
+            print(f"Warning: metadata.json not found at {REGION_DATA_DIR}")
+
+=== Cell 10 [code] ===
+# Load the pickle files created by preprocessing/export
+# These files should exist after running the preprocessing cell above
+
+train_pkl = REGION_DATA_DIR / 'region_1_train.pkl'
+valid_pkl = REGION_DATA_DIR / 'region_1_valid.pkl'
+test_pkl = REGION_DATA_DIR / 'region_1_test.pkl'
+
+print("Checking for pickle files...")
+for p in [train_pkl, valid_pkl, test_pkl]:
+    if not p.exists():
+        print(f"ERROR: Missing pickle file: {p}")
+        print("Please run the preprocessing cell above first.")
+        raise FileNotFoundError(f"Missing file: {p}")
+    else:
+        print(f"✓ Found {p.name}")
+
+print("\nLoading pickle files...")
+with open(train_pkl, 'rb') as f:
+    train_raw = pickle.load(f)
+with open(valid_pkl, 'rb') as f:
+    valid_raw = pickle.load(f)
+with open(test_pkl, 'rb') as f:
+    test_raw = pickle.load(f)
+
+print('train/valid/test windows:', len(train_raw), len(valid_raw), len(test_raw))
+if len(train_raw) > 0:
+    ex = train_raw[0]
+    print('sample keys:', list(ex.keys()))
+    print('sample traj shape:', ex['traj'].shape)
+    print('sample first row [lat,lon,sog,cog,time,mmsi]:', ex['traj'][0])
+
+=== Cell 11 [markdown] ===
+## 2) Config and Datasets
+
+=== Cell 12 [code] ===
+# Ensure metadata is loaded
+if 'meta' not in locals():
+    metadata_file = REGION_DATA_DIR / 'metadata.json'
+    if metadata_file.exists():
+        with open(metadata_file, 'r') as f:
+            meta = json.load(f)
+        print("Loaded metadata from file:", metadata_file)
+    else:
+        raise RuntimeError(f"Metadata file not found. Please run preprocessing first: {metadata_file}")
+else:
+    print("Metadata already loaded from preprocessing.")
+
+print("\nMetadata normalization bounds:")
+print(f"  Latitude:  [{meta['normalization']['lat_min']}, {meta['normalization']['lat_max']}]")
+print(f"  Longitude: [{meta['normalization']['lon_min']}, {meta['normalization']['lon_max']}]")
+
+=== Cell 13 [code] ===
+class RegionConfig:
+    retrain = True
+    tb_log = False
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    # training
+    max_epochs = 120
+    batch_size = 64
+    n_samples = 8
+    learning_rate = 6e-4
+    betas = (0.9, 0.95)
+    grad_norm_clip = 1.0
+    weight_decay = 0.1
+    lr_decay = True
+    warmup_tokens = 512 * 20
+    final_tokens = 260e9
+    num_workers = 4
+
+    # sequence
+    init_seqlen = 18
+    max_seqlen = 120
+    min_seqlen = 36
+
+    # model behavior
+    mode = 'pos'
+    sample_mode = 'pos_vicinity'
+    top_k = 10
+    r_vicinity = 40
+    blur = True
+    blur_learnable = False
+    blur_loss_w = 1.0
+    blur_n = 2
+
+    lat_min = meta['normalization']['lat_min']
+    lat_max = meta['normalization']['lat_max']
+    lon_min = meta['normalization']['lon_min']
+    lon_max = meta['normalization']['lon_max']
+
+    lat_size = 250
+    lon_size = 270
+    sog_size = 30
+    cog_size = 72
+    n_lat_embd = 256
+    n_lon_embd = 256
+    n_sog_embd = 128
+    n_cog_embd = 128
+    n_head = 8
+    n_layer = 8
+    embd_pdrop = 0.1
+    resid_pdrop = 0.1
+    attn_pdrop = 0.1
+    full_size = lat_size + lon_size + sog_size + cog_size
+    n_embd = n_lat_embd + n_lon_embd + n_sog_embd + n_cog_embd
+    savedir = str(RUN_DIR) + '/'
+    ckpt_path = str(RUN_DIR / 'model.pt')
+
+cf = RegionConfig()
+RUN_DIR.mkdir(parents=True, exist_ok=True)
+print('Device:', cf.device)
+print('Max epochs:', cf.max_epochs)
+print('Checkpoint path:', cf.ckpt_path)
+
+=== Cell 14 [code] ===
+train_ds = datasets.AISDataset(train_raw, max_seqlen=cf.max_seqlen + 1, device=cf.device)
+valid_ds = datasets.AISDataset(valid_raw, max_seqlen=cf.max_seqlen + 1, device=cf.device)
+test_ds = datasets.AISDataset(test_raw, max_seqlen=cf.max_seqlen + 1, device=cf.device)
+print('Dataset lens:', len(train_ds), len(valid_ds), len(test_ds))
+
+seq, mask, seqlen, mmsi, t0 = train_ds[0]
+print('seq shape:', seq.shape, 'mask shape:', mask.shape, 'seqlen:', int(seqlen))
+print('mmsi:', int(mmsi), 'time_start_unix:', int(t0))
+
+=== Cell 15 [code] ===
+plt.figure(figsize=(10, 3))
+plt.subplot(1, 2, 1)
+plt.plot(seq[:int(seqlen), 0].numpy(), label='lat_norm')
+plt.plot(seq[:int(seqlen), 1].numpy(), label='lon_norm')
+plt.legend()
+plt.title('Normalized position')
+
+plt.subplot(1, 2, 2)
+plt.plot(seq[:int(seqlen), 2].numpy(), label='sog_norm')
+plt.plot(seq[:int(seqlen), 3].numpy(), label='cog_norm')
+plt.legend()
+plt.title('Normalized kinematics')
+plt.tight_layout()
+plt.show()
+
+=== Cell 16 [markdown] ===
+## 3) Model Forward Sanity Check
+
+=== Cell 17 [code] ===
+model = models.TrAISformer(cf, partition_model=None).to(cf.device)
+print('n_params:', sum(p.numel() for p in model.parameters()))
+loader = DataLoader(train_ds, batch_size=cf.batch_size, shuffle=True)
+seqs, masks, *_ = next(iter(loader))
+seqs = seqs.to(cf.device)
+masks = masks[:, :-1].to(cf.device)
+logits, loss, loss_tuple = model(seqs, masks=masks, with_targets=True, return_loss_tuple=True)
+print('logits shape:', tuple(logits.shape))
+print('loss:', float(loss))
+print('head losses:', [float(x.mean()) for x in loss_tuple])
+
+=== Cell 18 [markdown] ===
+## 4) Model Architecture + Diagram + Eval Utilities
+
+=== Cell 19 [code] ===
+print(model)
+total = sum(p.numel() for p in model.parameters())
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f'Total params: {total:,}')
+print(f'Trainable params: {trainable:,}')
+
+try:
+    from torchinfo import summary
+    summary(model, input_size=(1, cf.max_seqlen + 1, 4), device=str(cf.device))
+except Exception as e:
+    print('torchinfo not available. Install with: pip install torchinfo')
+    print('detail:', e)
+
+=== Cell 20 [code] ===
+!pip install torchviz
+
+=== Cell 21 [code] ===
+# Optional compute-graph diagram export
+try:
+    from torchviz import make_dot
+    seqs_d, masks_d, *_ = next(iter(DataLoader(train_ds, batch_size=1, shuffle=True)))
+    seqs_d = seqs_d.to(cf.device)
+    masks_d = masks_d[:, :-1].to(cf.device)
+    logits_d, loss_d = model(seqs_d, masks=masks_d, with_targets=True)
+    dot = make_dot(loss_d.mean(), params=dict(model.named_parameters()))
+    dot.format = 'png'
+    out_graph = RUN_DIR / 'model_graph'
+    dot.render(str(out_graph), cleanup=True)
+    print('Saved model graph:', str(out_graph) + '.png')
+except Exception as e:
+    print('torchviz/graphviz not available. Install with: pip install torchviz and system graphviz.')
+    print('detail:', e)
+
+=== Cell 22 [code] ===
+def _split_logits(logits):
+    return torch.split(logits, (cf.lat_size, cf.lon_size, cf.sog_size, cf.cog_size), dim=-1)
+
+def evaluate_split(model, dataset, batch_size=32):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    model.eval()
+    losses = []
+    lat_accs, lon_accs, sog_accs, cog_accs = [], [], [], []
+    with torch.no_grad():
+        for seqs_e, masks_e, *_ in loader:
+            seqs_e = seqs_e.to(cf.device)
+            masks_e = masks_e[:, :-1].to(cf.device)
+            logits_e, loss_e = model(seqs_e, masks=masks_e, with_targets=True)
+            losses.append(float(loss_e.mean().cpu()))
+
+            idxs_e, _ = model.to_indexes(seqs_e, mode=getattr(model, 'partition_mode', 'uniform'))
+            targets_e = idxs_e[:, 1:, :]
+            lat_l, lon_l, sog_l, cog_l = _split_logits(logits_e)
+            lat_p = lat_l.argmax(dim=-1)
+            lon_p = lon_l.argmax(dim=-1)
+            sog_p = sog_l.argmax(dim=-1)
+            cog_p = cog_l.argmax(dim=-1)
+            lat_accs.append(float((lat_p == targets_e[:, :, 0]).float().mean().cpu()))
+            lon_accs.append(float((lon_p == targets_e[:, :, 1]).float().mean().cpu()))
+            sog_accs.append(float((sog_p == targets_e[:, :, 2]).float().mean().cpu()))
+            cog_accs.append(float((cog_p == targets_e[:, :, 3]).float().mean().cpu()))
+    metrics = {
+        'loss': float(np.mean(losses)) if losses else float('nan'),
+        'lat_acc': float(np.mean(lat_accs)) if lat_accs else float('nan'),
+        'lon_acc': float(np.mean(lon_accs)) if lon_accs else float('nan'),
+        'sog_acc': float(np.mean(sog_accs)) if sog_accs else float('nan'),
+        'cog_acc': float(np.mean(cog_accs)) if cog_accs else float('nan'),
+    }
+    metrics['joint_acc_mean'] = float(np.mean([metrics['lat_acc'], metrics['lon_acc'], metrics['sog_acc'], metrics['cog_acc']]))
+    return metrics
+
+def load_best_checkpoint(model):
+    best_path = RUN_DIR / 'best_model.pt'
+    if not best_path.exists():
+        print('No best checkpoint found at', best_path)
+        return False
+    payload = torch.load(best_path, map_location=cf.device, weights_only=False)
+    model.load_state_dict(payload['model_state'])
+    print('Loaded best checkpoint from', best_path)
+    return True
+
+=== Cell 23 [code] ===
+# Example pre-training baseline metrics (randomly initialized model)
+valid_metrics = evaluate_split(model, valid_ds, batch_size=cf.batch_size)
+test_metrics = evaluate_split(model, test_ds, batch_size=cf.batch_size)
+print('Validation metrics:', json.dumps(valid_metrics, indent=2))
+print('Test metrics:', json.dumps(test_metrics, indent=2))
+
+=== Cell 24 [markdown] ===
+## 5) MLflow + Early Stopping + Resume Training
+
+=== Cell 25 [code] ===
+model
+
+=== Cell 26 [code] ===
+# Launch MLflow UI from terminal if needed:
+# mlflow ui --host 0.0.0.0 --port 5000
+
+early_cfg = EarlyStoppingConfig(max_epochs=50, patience=5, min_delta=1e-4)
+trainer = TrAISformerMLflowTrainer(
+    model=model,
+    train_dataset=train_ds,
+    valid_dataset=valid_ds,
+    test_dataset=test_ds,
+    config=cf,
+    sample_fn=trainers.sample,
+    run_dir=RUN_DIR,
+    early_stop=early_cfg,
+    experiment_name='trAISformer_region1',
+)
+
+RUN_TRAIN = True
+if RUN_TRAIN:
+    trainer.train()
+    print('Training complete. Best checkpoint:', RUN_DIR / 'best_model.pt')
+else:
+    print('Skipped training.')
+
+=== Cell 27 [markdown] ===
+## 6) Post-Training Inference + Validation/Test Usage
+
+=== Cell 28 [code] ===
+if (RUN_DIR / 'best_model.pt').exists():
+    payload = torch.load(RUN_DIR / 'best_model.pt', map_location=cf.device, weights_only=False)
+    model.load_state_dict(payload['model_state'])
+model.eval()
+demo_batch = next(iter(DataLoader(test_ds, batch_size=4, shuffle=True)))
+demo_seqs, *_ = demo_batch
+demo_init = demo_seqs[:, :cf.init_seqlen, :].to(cf.device)
+with torch.no_grad():
+    preds = trainers.sample(
+        model,
+        demo_init,
+        steps=12,
+        temperature=1.0,
+        sample=True,
+        sample_mode=cf.sample_mode,
+        r_vicinity=cf.r_vicinity,
+        top_k=cf.top_k,
+    )
+print('pred shape:', tuple(preds.shape))
+print('first pred last token:', preds[0, -1].detach().cpu().numpy())
+
+=== Cell 29 [code] ===
+# How to utilize the trained model for validation/testing
+if load_best_checkpoint(model):
+    valid_metrics = evaluate_split(model, valid_ds, batch_size=cf.batch_size)
+    test_metrics = evaluate_split(model, test_ds, batch_size=cf.batch_size)
+    print('Best-checkpoint validation metrics:', json.dumps(valid_metrics, indent=2))
+    print('Best-checkpoint test metrics:', json.dumps(test_metrics, indent=2))
+
+=== Cell 30 [code] ===
+p = preds[0].detach().cpu().numpy()
+plt.figure(figsize=(5, 5))
+plt.plot(p[:, 1], p[:, 0], marker='o', ms=2)
+plt.title('Sampled normalized trajectory')
+plt.xlabel('lon_norm')
+plt.ylabel('lat_norm')
+plt.grid(True)
+plt.show()
+
+=== Cell 31 [code] ===
+
+
+=== Cell 32 [markdown] ===
+## 7) Fine-Tuning on 3-Month Dataset
+
+### Fine-Tuning Strategy
+
+This section demonstrates how to fine-tune the best-trained model (`best_model.pt`) on a 3-month dataset with comprehensive monitoring, logging, and visualization.
+
+**Key Features:**
+- **Checkpoint Resume**: Automatically resume from the last fine-tuning checkpoint if training is interrupted
+- **MLflow Integration**: Log all metrics (loss, accuracy per head, learning rate) to MLflow
+- **Per-Epoch Monitoring**: Track loss curves and accuracy evolution with `tqdm` progress bars
+- **Classification Head Loss**: Monitor individual loss contributions from lat, lon, sog, cog heads
+- **Early Stopping**: Stop training if validation loss plateaus
+- **Checkpointing Strategy**:
+  - `finetuned_best_model.pt`: Best model during fine-tuning
+  - `finetuned_last_checkpoint.pt`: Last checkpoint (for resuming)
+- **Visualization**: Plot training/validation loss and accuracy curves across epochs
+
+**Fine-Tuning Configuration:**
+- Batch size: 64 (larger batches for stability)
+- Learning rate: 2e-4 (reduced from 6e-4 for fine-tuning)
+- Max epochs: 120 with early stopping (patience=10)
+- Optimizer: AdamW with weight decay
+- Mixed precision training (if CUDA available)
+
+
+=== Cell 33 [code] ===
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+# Fine-tuning directory
+FINETUNE_DIR = GEODIR / 'results' / 'finetuned_q1_models'
+FINETUNE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Fine-tuning configuration
+class FineTuneConfig:
+    # Data config
+    finetune_batch_size = 64
+    finetune_num_workers = 4
+    
+    # Training config
+    finetune_lr = 2e-6  # Lower LR for fine-tuning
+    finetune_max_epochs = 120
+    finetune_warmup_epochs = 5
+    finetune_patience = 10  # early stopping patience
+    finetune_min_delta = 1e-4
+    
+    # Optimizer
+    weight_decay = 0.001
+    betas = (0.9, 0.95)
+    
+    # Checkpoint paths
+    pretrained_ckpt = RUN_DIR / 'best_model.pt'
+    finetuned_best_ckpt = FINETUNE_DIR / 'finetuned_best_model.pt'
+    finetuned_last_ckpt = FINETUNE_DIR / 'finetuned_last_checkpoint.pt'
+    log_file = FINETUNE_DIR / 'finetuning_log.txt'
+    
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+ftune_cfg = FineTuneConfig()
+print(f'Pretrained model: {ftune_cfg.pretrained_ckpt}')
+print(f'Fine-tune output dir: {FINETUNE_DIR}')
+print(f'Fine-tune config: LR={ftune_cfg.finetune_lr}, Batch={ftune_cfg.finetune_batch_size}, Max Epochs={ftune_cfg.finetune_max_epochs}')
+print(f'Device: {ftune_cfg.device}')
+
+
+=== Cell 34 [code] ===
+# Prepare fine-tuning data loaders from the Q1 (3-month) dataset
+# Note: In production, you would load additional months data here
+# For this demo, we use the train/valid split from Q1 as fine-tuning data
+
+# Create fine-tuning dataloaders
+finetune_train_loader = DataLoader(
+    train_ds,
+    batch_size=ftune_cfg.finetune_batch_size,
+    shuffle=True,
+    num_workers=ftune_cfg.finetune_num_workers,
+    pin_memory=True if str(ftune_cfg.device) == 'cuda:0' else False
+)
+
+finetune_valid_loader = DataLoader(
+    valid_ds,
+    batch_size=ftune_cfg.finetune_batch_size,
+    shuffle=False,
+    num_workers=ftune_cfg.finetune_num_workers,
+    pin_memory=True if str(ftune_cfg.device) == 'cuda:0' else False
+)
+
+print(f'Fine-tuning data loaders created:')
+print(f'  Train batches: {len(finetune_train_loader)} (total samples: {len(train_ds)})')
+print(f'  Valid batches: {len(finetune_valid_loader)} (total samples: {len(valid_ds)})')
+print(f'  Batch size: {ftune_cfg.finetune_batch_size}')
+
+
+=== Cell 35 [code] ===
+# Initialize fine-tuning: Load pretrained model
+ftune_model = models.TrAISformer(cf, partition_model=None).to(ftune_cfg.device)
+
+# Load pretrained checkpoint
+if ftune_cfg.pretrained_ckpt.exists():
+    payload = torch.load(ftune_cfg.pretrained_ckpt, map_location=ftune_cfg.device, weights_only=False)
+    ftune_model.load_state_dict(payload['model_state'])
+    print(f'✓ Loaded pretrained model from {ftune_cfg.pretrained_ckpt}')
+else:
+    print(f'Warning: Pretrained model not found at {ftune_cfg.pretrained_ckpt}')
+
+# Setup optimizer and scheduler
+optimizer = AdamW(
+    ftune_model.parameters(),
+    lr=ftune_cfg.finetune_lr,
+    betas=ftune_cfg.betas,
+    weight_decay=ftune_cfg.weight_decay
+)
+
+num_steps = len(finetune_train_loader) * ftune_cfg.finetune_max_epochs
+num_warmup_steps = len(finetune_train_loader) * ftune_cfg.finetune_warmup_epochs
+lr_scheduler = CosineAnnealingLR(optimizer, T_max=ftune_cfg.finetune_max_epochs)
+
+print(f'\nOptimizer: AdamW')
+print(f'  Learning rate: {ftune_cfg.finetune_lr}')
+print(f'  Weight decay: {ftune_cfg.weight_decay}')
+print(f'  Total steps: {num_steps}')
+print(f'  Warmup steps: {num_warmup_steps}')
+
+
+=== Cell 36 [code] ===
+# Fine-tuning training loop with comprehensive logging
+import time
+from collections import defaultdict
+
+# Initialize MLflow experiment for fine-tuning
+mlflow.set_experiment('trAISformer_finetuned_q1')
+
+# Initialize history tracking
+history = {
+    'epoch': [],
+    'train_loss': [],
+    'train_lat_loss': [],
+    'train_lon_loss': [],
+    'train_sog_loss': [],
+    'train_cog_loss': [],
+    'train_lat_acc': [],
+    'train_lon_acc': [],
+    'train_sog_acc': [],
+    'train_cog_acc': [],
+    'valid_loss': [],
+    'valid_lat_loss': [],
+    'valid_lon_loss': [],
+    'valid_sog_loss': [],
+    'valid_cog_loss': [],
+    'valid_lat_acc': [],
+    'valid_lon_acc': [],
+    'valid_sog_acc': [],
+    'valid_cog_acc': [],
+    'learning_rate': []
+}
+
+# Check for resume checkpoint
+start_epoch = 0
+best_valid_loss = float('inf')
+patience_counter = 0
+
+if ftune_cfg.finetuned_last_ckpt.exists():
+    checkpoint = torch.load(ftune_cfg.finetuned_last_ckpt, map_location=ftune_cfg.device, weights_only=False)
+    ftune_model.load_state_dict(checkpoint['model_state'])
+    optimizer.load_state_dict(checkpoint['optimizer_state'])
+    start_epoch = checkpoint['epoch'] + 1
+    best_valid_loss = checkpoint.get('best_valid_loss', float('inf'))
+    patience_counter = checkpoint.get('patience_counter', 0)
+    history = checkpoint['history']
+    print(f'✓ Resumed from epoch {start_epoch}, best_valid_loss={best_valid_loss:.6f}')
+else:
+    print('Starting fresh fine-tuning from epoch 0')
+
+# End any active MLflow runs (in case of re-execution)
+try:
+    if mlflow.active_run() is not None:
+        mlflow.end_run()
+except Exception as e:
+    print(f"Note: Could not close previous run - {e}")
+
+# Start MLflow run
+run = mlflow.start_run(run_name=f'finetuned_q1_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+mlflow.log_param('finetune_lr', ftune_cfg.finetune_lr)
+mlflow.log_param('finetune_batch_size', ftune_cfg.finetune_batch_size)
+mlflow.log_param('finetune_max_epochs', ftune_cfg.finetune_max_epochs)
+mlflow.log_param('finetune_patience', ftune_cfg.finetune_patience)
+
+# Main fine-tuning loop
+print(f'\n{"="*80}')
+print(f'Starting fine-tuning from epoch {start_epoch}/{ftune_cfg.finetune_max_epochs}')
+print(f'{"="*80}')
+
+ftune_model.train()
+epoch_start_time = time.time()
+
+for epoch in range(start_epoch, ftune_cfg.finetune_max_epochs):
+    # ===== Training Phase =====
+    train_losses = []
+    train_head_losses = {'lat': [], 'lon': [], 'sog': [], 'cog': []}
+    train_accs = {'lat': [], 'lon': [], 'sog': [], 'cog': []}
+    
+    pbar_train = tqdm(finetune_train_loader, desc=f'Epoch {epoch+1}/{ftune_cfg.finetune_max_epochs} [TRAIN]', leave=False)
+    
+    for batch_idx, (seqs, masks, *_) in enumerate(pbar_train):
+        seqs = seqs.to(ftune_cfg.device)
+        masks = masks[:, :-1].to(ftune_cfg.device)
+        
+        # Forward pass
+        logits, loss, loss_tuple = ftune_model(seqs, masks=masks, with_targets=True, return_loss_tuple=True)
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(ftune_model.parameters(), cf.grad_norm_clip)
+        optimizer.step()
+        
+        # Track losses
+        train_losses.append(loss.item())
+        loss_lat, loss_lon, loss_sog, loss_cog = loss_tuple
+        train_head_losses['lat'].append(loss_lat.mean().item())
+        train_head_losses['lon'].append(loss_lon.mean().item())
+        train_head_losses['sog'].append(loss_sog.mean().item())
+        train_head_losses['cog'].append(loss_cog.mean().item())
+        
+        # Get predictions for accuracy
+        with torch.no_grad():
+            idxs, _ = ftune_model.to_indexes(seqs, mode=getattr(ftune_model, 'partition_mode', 'uniform'))
+            targets = idxs[:, 1:, :]  # [batch, seq_len-1, 4]
+            preds = _split_logits(logits)
+            for i, (pred, key) in enumerate(zip(preds, ['lat', 'lon', 'sog', 'cog'])):
+                acc = (pred.argmax(dim=-1) == targets[:, :, i]).float().mean().item()
+                train_accs[key].append(acc)
+        
+        pbar_train.update(1)
+        if batch_idx % 100 == 0:
+            pbar_train.set_postfix({'loss': f'{loss.item():.4f}'})
+    
+    pbar_train.close()
+    
+    # Calculate average training metrics
+    epoch_train_loss = np.mean(train_losses)
+    epoch_train_lat_loss = np.mean(train_head_losses['lat'])
+    epoch_train_lon_loss = np.mean(train_head_losses['lon'])
+    epoch_train_sog_loss = np.mean(train_head_losses['sog'])
+    epoch_train_cog_loss = np.mean(train_head_losses['cog'])
+    epoch_train_lat_acc = np.mean(train_accs['lat'])
+    epoch_train_lon_acc = np.mean(train_accs['lon'])
+    epoch_train_sog_acc = np.mean(train_accs['sog'])
+    epoch_train_cog_acc = np.mean(train_accs['cog'])
+    
+    # ===== Validation Phase =====
+    ftune_model.eval()
+    valid_losses = []
+    valid_head_losses = {'lat': [], 'lon': [], 'sog': [], 'cog': []}
+    valid_accs = {'lat': [], 'lon': [], 'sog': [], 'cog': []}
+    
+    with torch.no_grad():
+        for seqs_v, masks_v, *_ in finetune_valid_loader:
+            seqs_v = seqs_v.to(ftune_cfg.device)
+            masks_v = masks_v[:, :-1].to(ftune_cfg.device)
+            
+            logits_v, loss_v, loss_tuple_v = ftune_model(seqs_v, masks=masks_v, with_targets=True, return_loss_tuple=True)
+            
+            valid_losses.append(loss_v.item())
+            loss_lat_v, loss_lon_v, loss_sog_v, loss_cog_v = loss_tuple_v
+            valid_head_losses['lat'].append(loss_lat_v.mean().item())
+            valid_head_losses['lon'].append(loss_lon_v.mean().item())
+            valid_head_losses['sog'].append(loss_sog_v.mean().item())
+            valid_head_losses['cog'].append(loss_cog_v.mean().item())
+            
+            # Accuracy computation
+            idxs_v, _ = ftune_model.to_indexes(seqs_v, mode=getattr(ftune_model, 'partition_mode', 'uniform'))
+            targets_v = idxs_v[:, 1:, :]
+            preds_v = _split_logits(logits_v)
+            for i, (pred_v, key) in enumerate(zip(preds_v, ['lat', 'lon', 'sog', 'cog'])):
+                acc_v = (pred_v.argmax(dim=-1) == targets_v[:, :, i]).float().mean().item()
+                valid_accs[key].append(acc_v)
+    
+    # Calculate average validation metrics
+    epoch_valid_loss = np.mean(valid_losses)
+    epoch_valid_lat_loss = np.mean(valid_head_losses['lat'])
+    epoch_valid_lon_loss = np.mean(valid_head_losses['lon'])
+    epoch_valid_sog_loss = np.mean(valid_head_losses['sog'])
+    epoch_valid_cog_loss = np.mean(valid_head_losses['cog'])
+    epoch_valid_lat_acc = np.mean(valid_accs['lat'])
+    epoch_valid_lon_acc = np.mean(valid_accs['lon'])
+    epoch_valid_sog_acc = np.mean(valid_accs['sog'])
+    epoch_valid_cog_acc = np.mean(valid_accs['cog'])
+    
+    # Get current learning rate
+    current_lr = optimizer.param_groups[0]['lr']
+    
+    # Track to history
+    history['epoch'].append(epoch + 1)
+    history['train_loss'].append(epoch_train_loss)
+    history['train_lat_loss'].append(epoch_train_lat_loss)
+    history['train_lon_loss'].append(epoch_train_lon_loss)
+    history['train_sog_loss'].append(epoch_train_sog_loss)
+    history['train_cog_loss'].append(epoch_train_cog_loss)
+    history['train_lat_acc'].append(epoch_train_lat_acc)
+    history['train_lon_acc'].append(epoch_train_lon_acc)
+    history['train_sog_acc'].append(epoch_train_sog_acc)
+    history['train_cog_acc'].append(epoch_train_cog_acc)
+    history['valid_loss'].append(epoch_valid_loss)
+    history['valid_lat_loss'].append(epoch_valid_lat_loss)
+    history['valid_lon_loss'].append(epoch_valid_lon_loss)
+    history['valid_sog_loss'].append(epoch_valid_sog_loss)
+    history['valid_cog_loss'].append(epoch_valid_cog_loss)
+    history['valid_lat_acc'].append(epoch_valid_lat_acc)
+    history['valid_lon_acc'].append(epoch_valid_lon_acc)
+    history['valid_sog_acc'].append(epoch_valid_sog_acc)
+    history['valid_cog_acc'].append(epoch_valid_cog_acc)
+    history['learning_rate'].append(current_lr)
+    
+    # MLflow logging
+    mlflow.log_metric('train_loss', epoch_train_loss, step=epoch)
+    mlflow.log_metric('train_lat_loss', epoch_train_lat_loss, step=epoch)
+    mlflow.log_metric('train_lon_loss', epoch_train_lon_loss, step=epoch)
+    mlflow.log_metric('train_sog_loss', epoch_train_sog_loss, step=epoch)
+    mlflow.log_metric('train_cog_loss', epoch_train_cog_loss, step=epoch)
+    mlflow.log_metric('valid_loss', epoch_valid_loss, step=epoch)
+    mlflow.log_metric('valid_lat_loss', epoch_valid_lat_loss, step=epoch)
+    mlflow.log_metric('valid_lon_loss', epoch_valid_lon_loss, step=epoch)
+    mlflow.log_metric('valid_sog_loss', epoch_valid_sog_loss, step=epoch)
+    mlflow.log_metric('valid_cog_loss', epoch_valid_cog_loss, step=epoch)
+    mlflow.log_metric('train_lat_acc', epoch_train_lat_acc, step=epoch)
+    mlflow.log_metric('valid_lat_acc', epoch_valid_lat_acc, step=epoch)
+    mlflow.log_metric('learning_rate', current_lr, step=epoch)
+    
+    # Check best model
+    if epoch_valid_loss < best_valid_loss - ftune_cfg.finetune_min_delta:
+        best_valid_loss = epoch_valid_loss
+        patience_counter = 0
+        # Save best model
+        torch.save({
+            'epoch': epoch,
+            'model_state': ftune_model.state_dict(),
+            'optimizer_state': optimizer.state_dict(),
+            'best_valid_loss': best_valid_loss,
+            'history': history,
+        }, ftune_cfg.finetuned_best_ckpt)
+        best_marker = '★ BEST'
+    else:
+        patience_counter += 1
+        best_marker = ''
+    
+    # Save last checkpoint
+    torch.save({
+        'epoch': epoch,
+        'model_state': ftune_model.state_dict(),
+        'optimizer_state': optimizer.state_dict(),
+        'best_valid_loss': best_valid_loss,
+        'patience_counter': patience_counter,
+        'history': history,
+    }, ftune_cfg.finetuned_last_ckpt)
+    
+    # Print epoch summary
+    print(f'Epoch {epoch+1:3d}/{ftune_cfg.finetune_max_epochs} | '
+          f'TrL: {epoch_train_loss:.4f} | '
+          f'VaL: {epoch_valid_loss:.4f} {best_marker} | '
+          f'Acc: Tr={epoch_train_lat_acc:.3f} Va={epoch_valid_lat_acc:.3f} | '
+          f'LR: {current_lr:.2e} | '
+          f'Pat: {patience_counter}/{ftune_cfg.finetune_patience}')
+    
+    # Update scheduler
+    lr_scheduler.step()
+    
+    # Early stopping check
+    if patience_counter >= ftune_cfg.finetune_patience:
+        print(f'\nEarly stopping triggered at epoch {epoch+1}')
+        break
+    
+    ftune_model.train()  # Back to training mode
+
+# End MLflow run
+mlflow.end_run()
+
+elapsed_time = time.time() - epoch_start_time
+print(f'\n{"="*80}')
+print(f'Fine-tuning completed! Total time: {elapsed_time/3600:.2f} hours')
+
+=== Cell 37 [code] ===
+# Visualization: Overall Loss Curves (Train vs Validation)
+fig, axes = plt.subplots(2, 2, figsize=(14, 10),dpi =720)
+fig.suptitle('Fine-Tuning: Loss Evolution Over Epochs', fontsize=14, fontweight='bold')
+
+# Total Loss
+axes[0, 0].plot(history['epoch'], history['train_loss'], label='Train Loss', linewidth=2, marker='o', markersize=3)
+axes[0, 0].plot(history['epoch'], history['valid_loss'], label='Valid Loss', linewidth=2, marker='s', markersize=3)
+axes[0, 0].set_xlabel('Epoch')
+axes[0, 0].set_ylabel('Loss')
+axes[0, 0].set_title('Overall Loss')
+axes[0, 0].legend()
+axes[0, 0].grid(True, alpha=0.3)
+
+# Latitude Loss
+axes[0, 1].plot(history['epoch'], history['train_lat_loss'], label='Train Lat Loss', linewidth=2, marker='o', markersize=3)
+axes[0, 1].plot(history['epoch'], history['valid_lat_loss'], label='Valid Lat Loss', linewidth=2, marker='s', markersize=3)
+axes[0, 1].set_xlabel('Epoch')
+axes[0, 1].set_ylabel('Loss')
+axes[0, 1].set_title('Latitude Head Loss')
+axes[0, 1].legend()
+axes[0, 1].grid(True, alpha=0.3)
+
+# Longitude Loss
+axes[1, 0].plot(history['epoch'], history['train_lon_loss'], label='Train Lon Loss', linewidth=2, marker='o', markersize=3)
+axes[1, 0].plot(history['epoch'], history['valid_lon_loss'], label='Valid Lon Loss', linewidth=2, marker='s', markersize=3)
+axes[1, 0].set_xlabel('Epoch')
+axes[1, 0].set_ylabel('Loss')
+axes[1, 0].set_title('Longitude Head Loss')
+axes[1, 0].legend()
+axes[1, 0].grid(True, alpha=0.3)
+
+# Speed Over Ground Loss
+axes[1, 1].plot(history['epoch'], history['train_sog_loss'], label='Train SOG Loss', linewidth=2, marker='o', markersize=3)
+axes[1, 1].plot(history['epoch'], history['valid_sog_loss'], label='Valid SOG Loss', linewidth=2, marker='s', markersize=3)
+axes[1, 1].set_xlabel('Epoch')
+axes[1, 1].set_ylabel('Loss')
+axes[1, 1].set_title('SOG Head Loss')
+axes[1, 1].legend()
+axes[1, 1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(FINETUNE_DIR / 'loss_curves.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print(f'✓ Saved loss curves to {FINETUNE_DIR}/loss_curves.png')
+
+
+=== Cell 38 [code] ===
+# Visualization: Classification Head Accuracy Evolution
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle('Fine-Tuning: Classification Accuracy Per Head', fontsize=14, fontweight='bold')
+
+# Latitude Accuracy
+axes[0, 0].plot(history['epoch'], history['train_lat_acc'], label='Train Accuracy', linewidth=2, marker='o', markersize=3, color='steelblue')
+axes[0, 0].plot(history['epoch'], history['valid_lat_acc'], label='Valid Accuracy', linewidth=2, marker='s', markersize=3, color='darkorange')
+axes[0, 0].set_xlabel('Epoch')
+axes[0, 0].set_ylabel('Accuracy')
+axes[0, 0].set_ylim([0, 1.05])
+axes[0, 0].set_title('Latitude Head Accuracy')
+axes[0, 0].legend()
+axes[0, 0].grid(True, alpha=0.3)
+
+# Longitude Accuracy
+axes[0, 1].plot(history['epoch'], history['train_lon_acc'], label='Train Accuracy', linewidth=2, marker='o', markersize=3, color='steelblue')
+axes[0, 1].plot(history['epoch'], history['valid_lon_acc'], label='Valid Accuracy', linewidth=2, marker='s', markersize=3, color='darkorange')
+axes[0, 1].set_xlabel('Epoch')
+axes[0, 1].set_ylabel('Accuracy')
+axes[0, 1].set_ylim([0, 1.05])
+axes[0, 1].set_title('Longitude Head Accuracy')
+axes[0, 1].legend()
+axes[0, 1].grid(True, alpha=0.3)
+
+# Speed Over Ground Accuracy
+axes[1, 0].plot(history['epoch'], history['train_sog_acc'], label='Train Accuracy', linewidth=2, marker='o', markersize=3, color='steelblue')
+axes[1, 0].plot(history['epoch'], history['valid_sog_acc'], label='Valid Accuracy', linewidth=2, marker='s', markersize=3, color='darkorange')
+axes[1, 0].set_xlabel('Epoch')
+axes[1, 0].set_ylabel('Accuracy')
+axes[1, 0].set_ylim([0, 1.05])
+axes[1, 0].set_title('SOG Head Accuracy')
+axes[1, 0].legend()
+axes[1, 0].grid(True, alpha=0.3)
+
+# Course Over Ground Accuracy
+axes[1, 1].plot(history['epoch'], history['train_cog_acc'], label='Train Accuracy', linewidth=2, marker='o', markersize=3, color='steelblue')
+axes[1, 1].plot(history['epoch'], history['valid_cog_acc'], label='Valid Accuracy', linewidth=2, marker='s', markersize=3, color='darkorange')
+axes[1, 1].set_xlabel('Epoch')
+axes[1, 1].set_ylabel('Accuracy')
+axes[1, 1].set_ylim([0, 1.05])
+axes[1, 1].set_title('COG Head Accuracy')
+axes[1, 1].legend()
+axes[1, 1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(FINETUNE_DIR / 'accuracy_curves.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print(f'✓ Saved accuracy curves to {FINETUNE_DIR}/accuracy_curves.png')
+
+
+=== Cell 39 [code] ===
+# Visualization: Learning Rate Schedule & COG Loss
+fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+fig.suptitle('Fine-Tuning: Learning Rate & COG Head Loss', fontsize=14, fontweight='bold')
+
+# Learning Rate Schedule
+axes[0].plot(history['epoch'], history['learning_rate'], linewidth=2, marker='o', markersize=4, color='green')
+axes[0].set_xlabel('Epoch')
+axes[0].set_ylabel('Learning Rate')
+axes[0].set_title('Learning Rate Schedule (Cosine Annealing)')
+axes[0].set_yscale('log')
+axes[0].grid(True, alpha=0.3)
+
+# COG Loss (usually hardest to predict)
+axes[1].plot(history['epoch'], history['train_cog_loss'], label='Train COG Loss', linewidth=2, marker='o', markersize=3, color='steelblue')
+axes[1].plot(history['epoch'], history['valid_cog_loss'], label='Valid COG Loss', linewidth=2, marker='s', markersize=3, color='darkorange')
+axes[1].set_xlabel('Epoch')
+axes[1].set_ylabel('Loss')
+axes[1].set_title('COG Head Loss (Course Over Ground)')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(FINETUNE_DIR / 'lr_and_cog.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print(f'✓ Saved LR and COG plots to {FINETUNE_DIR}/lr_and_cog.png')
+
+
+=== Cell 40 [code] ===
+# Fine-Tuning Summary: Comparing Baseline vs Fine-Tuned Model
+import pandas as pd
+
+# Load best fine-tuned checkpoint for evaluation
+ftune_best_model = models.TrAISformer(cf, partition_model=None).to(ftune_cfg.device)
+if ftune_cfg.finetuned_best_ckpt.exists():
+    payload = torch.load(ftune_cfg.finetuned_best_ckpt, map_location=ftune_cfg.device, weights_only=False)
+    ftune_best_model.load_state_dict(payload['model_state'])
+    best_epoch = payload['epoch']
+    print(f'✓ Loaded best fine-tuned model from epoch {best_epoch}')
+else:
+    print('Warning: Best fine-tuned checkpoint not found')
+
+# Evaluate baseline model on validation set
+baseline_valid_metrics = evaluate_split(model, valid_ds, batch_size=cf.batch_size)
+
+# Evaluate fine-tuned model on validation set
+ftune_valid_metrics = evaluate_split(ftune_best_model, valid_ds, batch_size=cf.batch_size)
+
+# Create comparison table
+comparison_df = pd.DataFrame({
+    'Metric': ['Loss', 'Lat Accuracy', 'Lon Accuracy', 'SOG Accuracy', 'COG Accuracy', 'Joint Accuracy'],
+    'Baseline': [
+        baseline_valid_metrics['loss'],
+        baseline_valid_metrics['lat_acc'],
+        baseline_valid_metrics['lon_acc'],
+        baseline_valid_metrics['sog_acc'],
+        baseline_valid_metrics['cog_acc'],
+        baseline_valid_metrics['joint_acc_mean'],
+    ],
+    'Fine-Tuned': [
+        ftune_valid_metrics['loss'],
+        ftune_valid_metrics['lat_acc'],
+        ftune_valid_metrics['lon_acc'],
+        ftune_valid_metrics['sog_acc'],
+        ftune_valid_metrics['cog_acc'],
+        ftune_valid_metrics['joint_acc_mean'],
+    ]
+})
+
+# Calculate improvement
+comparison_df['Improvement'] = comparison_df.apply(
+    lambda row: (row['Fine-Tuned'] - row['Baseline']) if row['Metric'] != 'Loss' else (row['Baseline'] - row['Fine-Tuned']),
+    axis=1
+)
+comparison_df['Improvement %'] = (comparison_df['Improvement'] / comparison_df['Baseline'].abs()) * 100
+
+print('\n' + '='*100)
+print('FINE-TUNING RESULTS: BASELINE vs FINE-TUNED MODEL')
+print('='*100)
+print(comparison_df.to_string(index=False))
+print('='*100)
+
+# Summary statistics from history
+print('\n' + '='*100)
+print('FINE-TUNING TRAINING STATISTICS')
+print('='*100)
+print(f'Total epochs completed: {len(history["epoch"])}')
+print(f'Best validation loss: {min(history["valid_loss"]):.6f} (at epoch {history["valid_loss"].index(min(history["valid_loss"]))+1})')
+print(f'Final validation loss: {history["valid_loss"][-1]:.6f}')
+print(f'Best validation accuracy (Lat): {max(history["valid_lat_acc"]):.4f}')
+print(f'Final validation accuracy (Lat): {history["valid_lat_acc"][-1]:.4f}')
+print(f'Learning rate (initial): {history["learning_rate"][0]:.2e}')
+print(f'Learning rate (final): {history["learning_rate"][-1]:.2e}')
+print('='*100)
+
+
+=== Cell 41 [code] ===
+# Save detailed training log to file
+log_content = f"""
+{'='*100}
+FINE-TUNING LOG: TrAISformer on Q1 (3-Month) Dataset
+{'='*100}
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+CONFIGURATION:
+  Pretrained model: {ftune_cfg.pretrained_ckpt}
+  Fine-tune directory: {FINETUNE_DIR}
+  Learning rate: {ftune_cfg.finetune_lr}
+  Batch size: {ftune_cfg.finetune_batch_size}
+  Max epochs: {ftune_cfg.finetune_max_epochs}
+  Early stopping patience: {ftune_cfg.finetune_patience}
+  Device: {ftune_cfg.device}
+
+TRAINING DATA:
+  Train samples: {len(train_ds)}
+  Valid samples: {len(valid_ds)}
+  Train batches: {len(finetune_train_loader)}
+  Valid batches: {len(finetune_valid_loader)}
+
+RESULTS:
+  Total epochs completed: {len(history["epoch"])}
+  Best validation loss: {min(history["valid_loss"]):.6f}
+  Final validation loss: {history["valid_loss"][-1]:.6f}
+  Best validation accuracy (joint): {max(history["valid_lat_acc"]):.4f}
+  Final validation accuracy (joint): {history["valid_lat_acc"][-1]:.4f}
+
+BASELINE vs FINE-TUNED COMPARISON:
+{comparison_df.to_string(index=False)}
+
+EPOCH-BY-EPOCH METRICS:
+Epoch | Train Loss | Valid Loss | Train Acc | Valid Acc | Learning Rate
+{'─'*70}
+"""
+
+for i, epoch in enumerate(history['epoch']):
+    log_content += f"{int(epoch)+1:5d} | {history['train_loss'][i]:10.4f} | {history['valid_loss'][i]:10.4f} | {history['train_lat_acc'][i]:9.4f} | {history['valid_lat_acc'][i]:9.4f} | {history['learning_rate'][i]:.2e}\n"
+
+log_content += f"""
+{'='*100}
+ARTIFACTS:
+  Best model: {ftune_cfg.finetuned_best_ckpt}
+  Last checkpoint: {ftune_cfg.finetuned_last_ckpt}
+  Loss curves: {FINETUNE_DIR}/loss_curves.png
+  Accuracy curves: {FINETUNE_DIR}/accuracy_curves.png
+  LR and COG plots: {FINETUNE_DIR}/lr_and_cog.png
+
+MLFLOW RUN:
+  Experiment: trAISformer_finetuned_q1
+  Run ID: {run.info.run_id}
+
+{'='*100}
+"""
+
+# Save log to file
+log_file = FINETUNE_DIR / 'finetuning_log.txt'
+with open(log_file, 'w') as f:
+    f.write(log_content)
+
+print(f'✓ Saved training log to {log_file}')
+
+# Save history as JSON for later analysis
+import json
+history_json = {k: (v if not isinstance(v, list) or all(isinstance(x, (int, float)) for x in v) else [float(x) for x in v]) 
+                 for k, v in history.items()}
+with open(FINETUNE_DIR / 'history.json', 'w') as f:
+    json.dump(history_json, f, indent=2)
+
+print(f'✓ Saved training history to {FINETUNE_DIR}/history.json')
+print(f'\n📊 All artifacts saved to: {FINETUNE_DIR}')
+
+
+=== Cell 42 [markdown] ===
+## 8) Using Fine-Tuned Model & Next Steps
+
+### Resuming Fine-Tuning
+
+If training was interrupted, the next run will automatically resume from the last checkpoint:
+- Loads `finetuned_last_checkpoint.pt` if it exists
+- Restores optimizer state, epoch number, and training history
+- Continues from where it left off
+
+**No special action needed** — just re-run the fine-tuning cell and it will resume automatically.
+
+### Model Artifacts
+
+After fine-tuning completes, you'll have:
+
+| File | Purpose |
+|------|---------|
+| `finetuned_best_model.pt` | Best model during fine-tuning (lowest validation loss) |
+| `finetuned_last_checkpoint.pt` | Last checkpoint (use for resuming training) |
+| `loss_curves.png` | Loss evolution for all 4 heads |
+| `accuracy_curves.png` | Accuracy evolution for all 4 heads |
+| `lr_and_cog.png` | Learning rate schedule and COG loss |
+| `finetuning_log.txt` | Full training log and statistics |
+| `history.json` | Training history in JSON format |
+
+All artifacts are saved to: `/CEE-Replication/Geohashed_traisformer/results/finetuned_q1_models/`
+
+### Loading Fine-Tuned Model for Inference
+
+```python
+# Load fine-tuned model
+ftune_inference_model = models.TrAISformer(cf, partition_model=None).to(device)
+payload = torch.load('results/finetuned_q1_models/finetuned_best_model.pt', map_location=device)
+ftune_inference_model.load_state_dict(payload['model_state'])
+ftune_inference_model.eval()
+
+# Run inference (same as original model)
+with torch.no_grad():
+    demo_init = test_batch[:, :cf.init_seqlen, :].to(device)
+    predictions = trainers.sample(
+        ftune_inference_model, demo_init,
+        steps=30, temperature=1.0, sample=True,
+        sample_mode=cf.sample_mode, r_vicinity=cf.r_vicinity, top_k=cf.top_k
+    )
+```
+
+### Monitoring in MLflow
+
+View fine-tuning metrics in MLflow dashboard:
+```bash
+mlflow ui --host 0.0.0.0 --port 5000
+```
+
+Then navigate to the `trAISformer_finetuned_q1` experiment to see:
+- Loss curves per head
+- Accuracy metrics per epoch
+- Learning rate schedule
+- Hyperparameters used
+
+### Key Insights from Fine-Tuning
+
+1. **Loss Convergence**: Compare train vs validation loss to check for overfitting
+   - If validation loss increases while training loss decreases → overfitting
+   - If both decrease smoothly → good generalization
+
+2. **Head Performance**: Monitor individual head accuracies
+   - Latitude/Longitude often converge faster than SOG/COG
+   - COG is typically the hardest to predict
+
+3. **Learning Rate Impact**: Lower LR for fine-tuning helps preserve learned features
+   - Cosine annealing provides smooth decay
+   - Watch for sudden loss spikes (may indicate LR too high)
+
+4. **Early Stopping**: Prevents overfitting by stopping when validation loss plateaus
+   - Patience of 10 gives room for fluctuations
+   - Best model is typically not the last epoch
+
+### Next Steps
+
+1. **Evaluate on Test Set**: Use `evaluate_split()` on test dataset
+2. **Ensemble**: Train multiple fine-tuned models (different seeds) and combine predictions
+3. **Multi-Month Fine-Tuning**: Load your own 3-month AIS data and repeat process
+4. **Domain Adaptation**: Fine-tune on different geographic regions
+5. **Quantization**: Convert to ONNX or TorchScript for deployment
+
+
+=== Cell 43 [code] ===
+# Utility: Load and inspect fine-tuning history
+def load_finetuning_history(history_file):
+    """Load training history from JSON file"""
+    import json
+    with open(history_file, 'r') as f:
+        return json.load(f)
+
+def plot_convergence_analysis(history, title='Convergence Analysis'):
+    """Create comprehensive convergence analysis plot"""
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    fig.suptitle(title, fontsize=14, fontweight='bold')
+    
+    # 1. Total Loss
+    axes[0, 0].plot(history['epoch'], history['train_loss'], label='Train', linewidth=2)
+    axes[0, 0].plot(history['epoch'], history['valid_loss'], label='Valid', linewidth=2)
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_title('Total Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # 2. Joint Accuracy
+    train_joint = [(h+l+s+c)/4 for h, l, s, c in 
+                   zip(history['train_lat_acc'], history['train_lon_acc'], 
+                       history['train_sog_acc'], history['train_cog_acc'])]
+    valid_joint = [(h+l+s+c)/4 for h, l, s, c in 
+                   zip(history['valid_lat_acc'], history['valid_lon_acc'], 
+                       history['valid_sog_acc'], history['valid_cog_acc'])]
+    axes[0, 1].plot(history['epoch'], train_joint, label='Train', linewidth=2)
+    axes[0, 1].plot(history['epoch'], valid_joint, label='Valid', linewidth=2)
+    axes[0, 1].set_ylabel('Accuracy')
+    axes[0, 1].set_ylim([0, 1.05])
+    axes[0, 1].set_title('Joint Accuracy (Mean of 4 Heads)')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # 3. Learning Rate
+    axes[0, 2].plot(history['epoch'], history['learning_rate'], linewidth=2, color='green')
+    axes[0, 2].set_ylabel('Learning Rate')
+    axes[0, 2].set_title('Learning Rate Schedule')
+    axes[0, 2].set_yscale('log')
+    axes[0, 2].grid(True, alpha=0.3)
+    
+    # 4. Per-head loss comparison
+    epochs = history['epoch']
+    axes[1, 0].plot(epochs, history['train_lat_loss'], label='Lat', linewidth=2)
+    axes[1, 0].plot(epochs, history['train_lon_loss'], label='Lon', linewidth=2)
+    axes[1, 0].plot(epochs, history['train_sog_loss'], label='SOG', linewidth=2)
+    axes[1, 0].plot(epochs, history['train_cog_loss'], label='COG', linewidth=2)
+    axes[1, 0].set_ylabel('Loss')
+    axes[1, 0].set_title('Per-Head Training Loss')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # 5. Per-head accuracy
+    axes[1, 1].plot(epochs, history['valid_lat_acc'], label='Lat', linewidth=2)
+    axes[1, 1].plot(epochs, history['valid_lon_acc'], label='Lon', linewidth=2)
+    axes[1, 1].plot(epochs, history['valid_sog_acc'], label='SOG', linewidth=2)
+    axes[1, 1].plot(epochs, history['valid_cog_acc'], label='COG', linewidth=2)
+    axes[1, 1].set_ylabel('Accuracy')
+    axes[1, 1].set_ylim([0, 1.05])
+    axes[1, 1].set_title('Per-Head Validation Accuracy')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    # 6. Overfitting detection (train-valid gap)
+    loss_gap = [vl - tl for tl, vl in zip(history['train_loss'], history['valid_loss'])]
+    axes[1, 2].plot(epochs, loss_gap, linewidth=2, color='red')
+    axes[1, 2].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    axes[1, 2].set_ylabel('Validation Loss - Training Loss')
+    axes[1, 2].set_title('Overfitting Indicator\n(Positive = Overfitting)')
+    axes[1, 2].grid(True, alpha=0.3)
+    
+    plt.xlabel('Epoch')
+    plt.tight_layout()
+    return fig
+
+# Example: Load and plot
+try:
+    hist_loaded = load_finetuning_history(FINETUNE_DIR / 'history.json')
+    fig = plot_convergence_analysis(hist_loaded, f'Convergence Analysis: {len(hist_loaded["epoch"])} Epochs')
+    plt.savefig(FINETUNE_DIR / 'convergence_analysis.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f'✓ Saved convergence analysis to {FINETUNE_DIR}/convergence_analysis.png')
+except Exception as e:
+    print(f'Note: {e}')
+
+=== Cell 44 [code] ===
+
+
+=== Cell 45 [markdown] ===
+# Post- Training Inference:
+
+=== Cell 46 [code] ===
